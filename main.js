@@ -17,9 +17,12 @@ precision highp float;
 #define Infinity 1.0 / 0.0
 #define tMin 0.001
 #define tMax Infinity
-#define samplesPerPixel 1
-#define maxDepth 50
-#define randomSeed 49324214
+#define samplesPerPixel 100
+#define maxDepth 10
+#define randomSeed 49324217
+#define LAMBERTIAN 0
+#define METAL 1
+#define DIELECTRIC 2
 
 struct Ray {
     vec3 origin;
@@ -32,11 +35,19 @@ struct hitRecord {
     float t;
     bool frontFace;
     bool hit;
+    vec3 attenuation;
+    int material;
+    float fuzz;
+    float indexOfRefraction;
 };
 
 struct Sphere {
     vec3 center;
     float radius;
+    int material;
+    vec3 albedo;
+    float fuzz;
+    float indexOfRefraction;
 };
 
 out vec4 outputColor;
@@ -47,7 +58,10 @@ uniform float time;
 const float fov = 30.0 * PI / 180.0;
 const float canvasDepth = tan(fov / 2.0);
 
-const Sphere spheres[2] = Sphere[2](Sphere(vec3(0, 0, -1), 0.5), Sphere(vec3(0, -100.5, -1), 100.0));
+const Sphere spheres[4] = Sphere[4](Sphere(vec3( 0.0,    0.0, -1.0),   0.5, LAMBERTIAN, vec3(0.7, 0.3, 0.3), 0.0, 0.0), 
+                                    Sphere(vec3( 0.0, -100.5, -1.0), 100.0, LAMBERTIAN, vec3(0.8, 0.8, 0.0), 0.0, 0.0),
+                                    Sphere(vec3(-1.0,    0.0, -1.0),   0.5, DIELECTRIC, vec3(0.8, 0.8, 0.8), 0.0, 1.5),
+                                    Sphere(vec3( 1.0,    0.0, -1.0),   0.5, METAL,      vec3(0.8, 0.6, 0.2), 0.3, 0.0));
 
 vec2 randSeed = vec2(0.0);
 
@@ -79,13 +93,25 @@ float random(vec2 seed) {
     return float(h32) / 2147483647.0;
 }
 
-float standardNormalDistribution01(vec2 seed) {
-    return sqrt(-2.0 * log(random(seed + vec2(.77, .16)))) * cos(2.0 * PI * random(seed + vec2(-.143, .84)));
+vec2 hash(vec2 p) {
+    p /= 1000000.0;
+	vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+    p3 += dot(p3, p3.yzx+33.33);
+    return fract((p3.xx+p3.yz)*p3.zy) * 1000000.0;
 }
 
-vec3 randomUnitSphere(vec2 seed) {
-    vec3 p = vec3(standardNormalDistribution01(seed + vec2(-.24, .85)), standardNormalDistribution01(seed + vec2(.64, -.94)), standardNormalDistribution01(seed + vec2(.23, .34)));
-    return normalize(p) * pow(random(seed), 0.3333);
+float normalRandom(vec2 seed) {
+    // return a normally distributed random value
+    float v1 = random(hash(seed + vec2(23.45, 37.04)));
+    float v2 = random(hash(seed + vec2(84.36, 76.34)));
+    return cos(2.0 * PI * v2) * sqrt(-2.0 * log(v1));
+}
+
+vec3 randomUnitVector(vec2 seed) {
+    float n1 = normalRandom(hash(seed + vec2(59.23, 69.48)));
+    float n2 = normalRandom(hash(seed + vec2(39.85, 54.94)));
+    float n3 = normalRandom(hash(seed + vec2(49.57, 19.38)));
+    return normalize(vec3(n1, n2, n3));
 }
 
 void hitSphere(Sphere sphere, Ray ray, inout hitRecord record) {
@@ -112,42 +138,77 @@ void hitSphere(Sphere sphere, Ray ray, inout hitRecord record) {
         record.frontFace = dot(ray.direction, outwardNormal) < 0.0;
         record.normal = record.frontFace ? outwardNormal : -outwardNormal;
         record.hit = true;
+        record.material = sphere.material;
+        record.attenuation = sphere.albedo;
+        record.fuzz = sphere.fuzz;
+        record.indexOfRefraction = sphere.indexOfRefraction;
     }
 }
 
 vec3 color(Ray ray, int depth, vec2 seed) {
     int searchDepth = 0;
     vec3 col = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
     for (int i = 0; i < depth; i++) {
-        hitRecord record = hitRecord(vec3(0.0), vec3(0.0), Infinity, false, false);
+        hitRecord record = hitRecord(vec3(0.0), vec3(0.0), Infinity, false, false, vec3(0.5), LAMBERTIAN, 0.0, 0.0);
         for (int j = 0; j < spheres.length(); j++) {
             Sphere sphere = spheres[j];
             hitSphere(sphere, ray, record);
         }
         if (record.hit) {
-            vec3 target = record.position + record.normal + randomUnitSphere(seed);
+            vec3 scatter;
+            if (record.material == LAMBERTIAN) {
+                scatter = record.normal + randomUnitVector(seed);
+                if (dot(scatter, scatter) < 0.001) {
+                    scatter = record.normal;
+                }
+            } else if (record.material == METAL) {
+                scatter = reflect(ray.direction, record.normal + randomUnitVector(seed) * record.fuzz);
+                if (dot(scatter, record.normal) < 0.0) {
+                    col = vec3(0.0);
+                    break;
+                }
+            } else if (record.material == DIELECTRIC) {
+                record.attenuation = vec3(1.0, 1.0, 1.0);
+                float refractionRatio = record.frontFace ? (1.0 / record.indexOfRefraction) : record.indexOfRefraction;
+
+                vec3 unitDirection = normalize(ray.direction);
+                float cosTheta = min(dot(-unitDirection, record.normal), 1.0);
+                float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+                bool cannotRefract = refractionRatio * sinTheta > 1.0;
+                vec3 direction;
+
+                if (cannotRefract)
+                    direction = reflect(unitDirection, record.normal);
+                else
+                    direction = refract(unitDirection, record.normal, refractionRatio);
+
+                scatter = direction;
+            }
+            ray.direction = scatter;
             ray.origin = record.position;
-            ray.direction = normalize(target - record.position);
+            attenuation *= record.attenuation;
         } else {
-            searchDepth = i;
             float t = 0.5 * (ray.direction.y + 1.0);
             col = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t);
             break;
         }
-        seed += vec2(.1493, .9458);
+        seed = hash(seed.yx + vec2(30.42, 19.43));
     }
-    return pow(0.5, float(searchDepth)) * col;
+    return attenuation * col;
 }
 
 void main() {
     randSeed = gl_FragCoord.xy * 1000.0;
     vec3 col = vec3(0.0);
     for (int i = 0; i < samplesPerPixel; i++) {
-        Ray ray = Ray(vec3(0.0), normalize(vec3((2.0 * gl_FragCoord.xy + random(randSeed) - scale) / scale.y, -1)));
+        Ray ray = Ray(vec3(0.0), normalize(vec3((2.0 * gl_FragCoord.xy + vec2(random(hash(randSeed + vec2(19.43, 93.42))), random(hash(randSeed + vec2(35.48, 34.41)))) - scale) / scale.y, -1)));
         col += color(ray, maxDepth, randSeed + vec2(.2834, .1934));
+        randSeed = hash(randSeed + vec2(84.72, 10.83));
     }
     col /= float(samplesPerPixel);
-    outputColor = vec4(col, 1.0);
+    outputColor = vec4(sqrt(col), 1.0);
 }
 `;
 
@@ -211,7 +272,7 @@ function draw() {
     
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     const loop = window.setTimeout(function() {
-        window.requestAnimationFrame(draw);
+        //window.requestAnimationFrame(draw);
         window.clearTimeout(loop);
     }, rate);
 }
